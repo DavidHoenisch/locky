@@ -256,6 +256,4 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Support
 
-- GitHub Issues: https://github.com/yourusername/locky/issues
-- Documentation: https://docs.locky.dev
-- Discord: https://discord.gg/locky
+- GitHub Issues: https://github.com/DavidHoenisch/locky/issues
