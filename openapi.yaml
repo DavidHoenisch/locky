@@ -1,0 +1,1493 @@
+openapi: 3.1.0
+info:
+  title: StellarAuth
+  version: 0.1.0
+  description: |
+    StellarAuth is a single-binary, library-first identity platform implementing:
+    - Host-based multi-tenancy (wildcard subdomains + custom domains)
+    - OAuth2/OIDC (Auth Code + PKCE, Refresh Token, Client Credentials)
+    - Web sessions (optional hosted UI)
+    - JWT access tokens (tenant-scoped issuer)
+    - RBAC via Casbin (domain = tenant_id)
+    - Declarative policies + auditable hooks (hooks not exposed via HTTP)
+    - Postgres as system-of-record for all state
+
+    Notes on multi-tenancy:
+    - Public endpoints are served on tenant hosts, e.g. https://{tenant}.auth.example.com
+      or on a verified custom domain, e.g. https://login.customer.com
+    - Admin endpoints are served on a stable admin host, e.g. https://admin-auth.example.com
+
+servers:
+  - url: https://admin-auth.example.com
+    description: Admin API (stable host)
+  - url: https://{tenantHost}
+    description: Public tenant endpoints (wildcard or custom domain)
+    variables:
+      tenantHost:
+        default: tenant.auth.example.com
+        description: A tenant host such as {slug}.auth.example.com or a verified custom domain.
+
+tags:
+  - name: Health
+  - name: AdminAuth
+  - name: Tenants
+  - name: Domains
+  - name: Users
+  - name: Clients
+  - name: Keys
+  - name: Sessions
+  - name: Audit
+  - name: Policies
+  - name: RBAC
+  - name: OIDC
+  - name: UI
+
+components:
+  securitySchemes:
+    AdminApiKey:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+    BearerToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    TenantIdPath:
+      name: tenant_id
+      in: path
+      required: true
+      schema: { type: string, description: Tenant UUID }
+    UserIdPath:
+      name: user_id
+      in: path
+      required: true
+      schema: { type: string, description: User UUID }
+    ClientIdPath:
+      name: client_id
+      in: path
+      required: true
+      schema: { type: string, description: Client UUID (internal id) }
+    DomainIdPath:
+      name: domain_id
+      in: path
+      required: true
+      schema: { type: string, description: Domain UUID }
+    PolicyIdPath:
+      name: policy_id
+      in: path
+      required: true
+      schema: { type: string, description: Policy UUID }
+    SessionIdPath:
+      name: session_id
+      in: path
+      required: true
+      schema: { type: string, description: Session UUID }
+    RbacTupleIdPath:
+      name: tuple_id
+      in: path
+      required: true
+      schema: { type: string, description: RBAC tuple UUID }
+
+  schemas:
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error: { type: string }
+        message: { type: string }
+        request_id: { type: string }
+        details: { type: object, additionalProperties: true }
+
+    Health:
+      type: object
+      properties:
+        status: { type: string, enum: [ok] }
+        version: { type: string }
+        time: { type: string, format: date-time }
+
+    Tenant:
+      type: object
+      required: [id, slug, name, status, created_at]
+      properties:
+        id: { type: string, description: Tenant UUID }
+        slug: { type: string, description: Tenant slug used for wildcard subdomain routing }
+        name: { type: string }
+        status: { type: string, enum: [active, suspended] }
+        created_at: { type: string, format: date-time }
+
+    TenantDomain:
+      type: object
+      required: [id, tenant_id, domain, created_at]
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        domain: { type: string, description: Custom domain hostname (no scheme/path) }
+        verified_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    User:
+      type: object
+      required: [id, tenant_id, email, email_verified, status, created_at]
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        email: { type: string, format: email }
+        email_verified: { type: boolean }
+        status: { type: string, enum: [active, disabled] }
+        display_name: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time, nullable: true }
+
+    Client:
+      type: object
+      required: [id, tenant_id, name, client_id, created_at]
+      properties:
+        id: { type: string, description: Internal UUID for client record }
+        tenant_id: { type: string }
+        name: { type: string }
+        client_id: { type: string, description: OAuth2 client_id (public identifier) }
+        client_secret_last4: { type: string, nullable: true }
+        redirect_uris:
+          type: array
+          items: { type: string, format: uri }
+        post_logout_redirect_uris:
+          type: array
+          items: { type: string, format: uri }
+        grant_types:
+          type: array
+          items:
+            type: string
+            enum: [authorization_code, refresh_token, client_credentials]
+        response_types:
+          type: array
+          items:
+            type: string
+            enum: [code]
+        scopes:
+          type: array
+          items: { type: string }
+        token_ttl_seconds: { type: integer, minimum: 60, maximum: 86400, default: 900 }
+        refresh_ttl_seconds: { type: integer, minimum: 300, maximum: 2592000, default: 1209600 }
+        created_at: { type: string, format: date-time }
+
+    ClientSecret:
+      type: object
+      required: [client_id, client_secret]
+      properties:
+        client_id: { type: string }
+        client_secret: { type: string, description: Only returned on creation/rotation }
+
+    JwkSet:
+      type: object
+      properties:
+        keys:
+          type: array
+          items: { type: object, additionalProperties: true }
+
+    KeyRotationStatus:
+      type: object
+      required: [tenant_id, active_kid, rotated_at]
+      properties:
+        tenant_id: { type: string }
+        active_kid: { type: string }
+        previous_kids:
+          type: array
+          items: { type: string }
+        rotated_at: { type: string, format: date-time }
+        grace_expires_at: { type: string, format: date-time, nullable: true }
+
+    Session:
+      type: object
+      required: [id, tenant_id, user_id, created_at, last_seen_at]
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        user_id: { type: string }
+        client_id: { type: string, nullable: true, description: OAuth client_id (public) when known }
+        ip: { type: string, nullable: true }
+        user_agent: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time }
+        revoked_at: { type: string, format: date-time, nullable: true }
+
+    AuditEvent:
+      type: object
+      required: [id, tenant_id, type, created_at]
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        actor_type: { type: string, enum: [admin, user, system] }
+        actor_id: { type: string, nullable: true }
+        type: { type: string }
+        ip: { type: string, nullable: true }
+        user_agent: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        data: { type: object, additionalProperties: true }
+
+    Policy:
+      type: object
+      required: [id, tenant_id, name, version, status, document, created_at]
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        name: { type: string }
+        version: { type: integer, minimum: 1 }
+        status: { type: string, enum: [active, inactive] }
+        document:
+          type: object
+          additionalProperties: true
+          description: JSON policy document (versioned schema owned by StellarAuth)
+        created_at: { type: string, format: date-time }
+
+    PolicyBinding:
+      type: object
+      required: [id, tenant_id, policy_id, bind_type, bind_id, created_at]
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        policy_id: { type: string }
+        bind_type: { type: string, enum: [tenant, client, user, group] }
+        bind_id: { type: string, description: ID for bind target (tenant_id/client_id/user_id/group_id) }
+        created_at: { type: string, format: date-time }
+
+    RbacTuple:
+      type: object
+      required: [id, tenant_id, tuple_type, v0, v1, v2, created_at]
+      properties:
+        id: { type: string }
+        tenant_id: { type: string, description: Casbin domain; typically tenant UUID }
+        tuple_type: { type: string, enum: [p, g] }
+        v0: { type: string, description: p: subject (role:*), g: user:* }
+        v1: { type: string, description: domain (tenant_id) or role, depending on model }
+        v2: { type: string, description: object (for p) or role (for g) }
+        v3: { type: string, nullable: true, description: action (for p) }
+        v4: { type: string, nullable: true }
+        v5: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    RbacEnforceRequest:
+      type: object
+      required: [subject, object, action]
+      properties:
+        subject: { type: string, description: "e.g., user:{uuid} or role:{name}" }
+        object: { type: string, description: "e.g., project:123, folder:abc, *" }
+        action: { type: string, description: "e.g., read, write, admin" }
+
+    RbacEnforceResponse:
+      type: object
+      required: [allowed]
+      properties:
+        allowed: { type: boolean }
+
+    OidcDiscovery:
+      type: object
+      additionalProperties: true
+      description: Standard OIDC discovery document
+
+    OauthTokenResponse:
+      type: object
+      required: [access_token, token_type, expires_in]
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, enum: [Bearer] }
+        expires_in: { type: integer }
+        refresh_token: { type: string, nullable: true }
+        id_token: { type: string, nullable: true }
+        scope: { type: string, nullable: true }
+
+    UserInfo:
+      type: object
+      additionalProperties: true
+      description: Standard OIDC userinfo response (claims vary by scopes and policies)
+
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+
+  # =========================
+  # Admin Auth (bootstrap)
+  # =========================
+  /admin/auth/keys:
+    post:
+      tags: [AdminAuth]
+      summary: Create an admin API key (bootstrap; restrict in production)
+      description: |
+        Creates an admin API key. In production, this endpoint should be disabled or
+        guarded by an out-of-band bootstrap mechanism.
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key]
+                properties:
+                  key: { type: string }
+        "500":
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    get:
+      tags: [AdminAuth]
+      summary: List admin API keys
+      security: [{ AdminApiKey: [] }]
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Unauthorized
+
+  # =========================
+  # Tenants
+  # =========================
+  /admin/tenants:
+    get:
+      tags: [Tenants]
+      security: [{ AdminApiKey: [] }]
+      summary: List tenants
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tenants]
+                properties:
+                  tenants:
+                    type: array
+                    items: { $ref: "#/components/schemas/Tenant" }
+                  next_cursor: { type: string, nullable: true }
+        "401":
+          description: Unauthorized
+    post:
+      tags: [Tenants]
+      security: [{ AdminApiKey: [] }]
+      summary: Create tenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [slug, name]
+              properties:
+                slug: { type: string, pattern: "^[a-z0-9][a-z0-9-]{1,62}$" }
+                name: { type: string }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tenant" }
+        "409":
+          description: Slug already exists
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/tenants/{tenant_id}:
+    get:
+      tags: [Tenants]
+      security: [{ AdminApiKey: [] }]
+      summary: Get tenant
+      parameters: [{ $ref: "#/components/parameters/TenantIdPath" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tenant" }
+        "404":
+          description: Not found
+    patch:
+      tags: [Tenants]
+      security: [{ AdminApiKey: [] }]
+      summary: Update tenant
+      parameters: [{ $ref: "#/components/parameters/TenantIdPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                status: { type: string, enum: [active, suspended] }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tenant" }
+
+  # =========================
+  # Domains (custom domain routing)
+  # =========================
+  /admin/tenants/{tenant_id}/domains:
+    get:
+      tags: [Domains]
+      security: [{ AdminApiKey: [] }]
+      summary: List custom domains for tenant
+      parameters: [{ $ref: "#/components/parameters/TenantIdPath" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [domains]
+                properties:
+                  domains:
+                    type: array
+                    items: { $ref: "#/components/schemas/TenantDomain" }
+    post:
+      tags: [Domains]
+      security: [{ AdminApiKey: [] }]
+      summary: Add custom domain for tenant
+      description: |
+        Adds a custom domain. Verification can be performed via DNS challenge or other
+        out-of-band mechanism. This spec provides endpoints to initiate and confirm verification.
+      parameters: [{ $ref: "#/components/parameters/TenantIdPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [domain]
+              properties:
+                domain: { type: string, description: Hostname only (no scheme/path) }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TenantDomain" }
+        "409":
+          description: Domain already exists
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/tenants/{tenant_id}/domains/{domain_id}:
+    delete:
+      tags: [Domains]
+      security: [{ AdminApiKey: [] }]
+      summary: Remove custom domain
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - { $ref: "#/components/parameters/DomainIdPath" }
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          description: Not found
+
+  /admin/tenants/{tenant_id}/domains/{domain_id}/verify/start:
+    post:
+      tags: [Domains]
+      security: [{ AdminApiKey: [] }]
+      summary: Start domain verification
+      description: Returns a DNS challenge token (example: TXT record) to prove control of the domain.
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - { $ref: "#/components/parameters/DomainIdPath" }
+      responses:
+        "200":
+          description: Challenge issued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [method, record_name, record_type, record_value]
+                properties:
+                  method: { type: string, enum: [dns_txt] }
+                  record_name: { type: string }
+                  record_type: { type: string, enum: [TXT] }
+                  record_value: { type: string }
+
+  /admin/tenants/{tenant_id}/domains/{domain_id}/verify/confirm:
+    post:
+      tags: [Domains]
+      security: [{ AdminApiKey: [] }]
+      summary: Confirm domain verification
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - { $ref: "#/components/parameters/DomainIdPath" }
+      responses:
+        "200":
+          description: Verified (or still pending)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TenantDomain" }
+
+  # =========================
+  # Users
+  # =========================
+  /admin/tenants/{tenant_id}/users:
+    get:
+      tags: [Users]
+      security: [{ AdminApiKey: [] }]
+      summary: List users in tenant
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - name: email
+          in: query
+          required: false
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+    post:
+      tags: [Users]
+      security: [{ AdminApiKey: [] }]
+      summary: Create user
+      description: |
+        Creates a user record. Credential enrollment (password set, email verification)
+        may be performed via separate flows (UI or API) depending on configuration.
+      parameters: [{ $ref: "#/components/parameters/TenantIdPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+                display_name: { type: string }
+                status: { type: string, enum: [active, disabled], default: active }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "409":
+          description: Email already exists in tenant
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/tenants/{tenant_id}/users/{user_id}:
+    get:
+      tags: [Users]
+      security: [{ AdminApiKey: [] }]
+      summary: Get user
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - { $ref: "#/components/parameters/UserIdPath" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "404":
+          description: Not found
+    patch:
+      tags: [Users]
+      security: [{ AdminApiKey: [] }]
+      summary: Update user
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - { $ref: "#/components/parameters/UserIdPath" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string }
+                status: { type: string, enum: [active, disabled] }
+                email_verified: { type: boolean }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+
+  /admin/tenants/{tenant_id}/users/{user_id}/password:
+    put:
+      tags: [Users]
+      security: [{ AdminApiKey: [] }]
+      summary: Set or reset user password (admin)
+      description: |
+        Sets a user password. Implementation must hash password with Argon2id (or equivalent).
+        This endpoint is typically restricted to admin and used for recovery / bootstrap.
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - { $ref: "#/components/parameters/UserIdPath" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string, minLength: 8 }
+      responses:
+        "204":
+          description: Updated
+        "404":
+          description: Not found
+
+  # =========================
+  # Clients (OIDC apps)
+  # =========================
+  /admin/tenants/{tenant_id}/clients:
+    get:
+      tags: [Clients]
+      security: [{ AdminApiKey: [] }]
+      summary: List OIDC clients
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+    post:
+      tags: [Clients]
+      security: [{ AdminApiKey: [] }]
+      summary: Create OIDC client
+      parameters: [{ $ref: "#/components/parameters/TenantIdPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, redirect_uris]
+              properties:
+                name: { type: string }
+                redirect_uris:
+                  type: array
+                  minItems: 1
+                  items: { type: string, format: uri }
+                post_logout_redirect_uris:
+                  type: array
+                  items: { type: string, format: uri }
+                grant_types:
+                  type: array
+                  items:
+                    type: string
+                    enum: [authorization_code, refresh_token, client_credentials]
+                scopes:
+                  type: array
+                  items: { type: string }
+                token_ttl_seconds: { type: integer, minimum: 60, maximum: 86400 }
+                refresh_ttl_seconds: { type: integer, minimum: 300, maximum: 2592000 }
+      responses:
+        "201":
+          description: Created (client_secret only returned once)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Client"
+                  - type: object
+                    properties:
+                      client_secret: { type: string, description: Only returned on creation }
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /admin/tenants/{tenant_id}/clients/{client_id}:
+    get:
+      tags: [Clients]
+      security: [{ AdminApiKey: [] }]
+      summary: Get OIDC client
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - { $ref: "#/components/parameters/ClientIdPath" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Client" }
+    patch:
+      tags: [Clients]
+      security: [{ AdminApiKey: [] }]
+      summary: Update OIDC client
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - { $ref: "#/components/parameters/ClientIdPath" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                redirect_uris:
+                  type: array
+                  items: { type: string, format: uri }
+                post_logout_redirect_uris:
+                  type: array
+                  items: { type: string, format: uri }
+                grant_types:
+                  type: array
+                  items:
+                    type: string
+                    enum: [authorization_code, refresh_token, client_credentials]
+                scopes:
+                  type: array
+                  items: { type: string }
+                token_ttl_seconds: { type: integer, minimum: 60, maximum: 86400 }
+                refresh_ttl_seconds: { type: integer, minimum: 300, maximum: 2592000 }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Client" }
+    delete:
+      tags: [Clients]
+      security: [{ AdminApiKey: [] }]
+      summary: Delete OIDC client
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - { $ref: "#/components/parameters/ClientIdPath" }
+      responses:
+        "204":
+          description: Deleted
+
+  /admin/tenants/{tenant_id}/clients/{client_id}/secret/rotate:
+    post:
+      tags: [Clients]
+      security: [{ AdminApiKey: [] }]
+      summary: Rotate client secret
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - { $ref: "#/components/parameters/ClientIdPath" }
+      responses:
+        "201":
+          description: Rotated (new secret returned once)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ClientSecret" }
+
+  # =========================
+  # Keys / JWKS
+  # =========================
+  /admin/tenants/{tenant_id}/keys/jwks:
+    get:
+      tags: [Keys]
+      security: [{ AdminApiKey: [] }]
+      summary: Get tenant signing JWKS (admin view)
+      parameters: [{ $ref: "#/components/parameters/TenantIdPath" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JwkSet" }
+
+  /admin/tenants/{tenant_id}/keys/rotate:
+    post:
+      tags: [Keys]
+      security: [{ AdminApiKey: [] }]
+      summary: Rotate tenant signing key
+      description: |
+        Starts or performs key rotation. Implementation may be synchronous or async.
+        Rotation must preserve a grace window where previous keys remain published for verification.
+      parameters: [{ $ref: "#/components/parameters/TenantIdPath" }]
+      responses:
+        "202":
+          description: Rotation started
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/KeyRotationStatus" }
+
+  /admin/tenants/{tenant_id}/keys/rotation:
+    get:
+      tags: [Keys]
+      security: [{ AdminApiKey: [] }]
+      summary: Get key rotation status
+      parameters: [{ $ref: "#/components/parameters/TenantIdPath" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/KeyRotationStatus" }
+
+  # =========================
+  # Sessions
+  # =========================
+  /admin/tenants/{tenant_id}/sessions:
+    get:
+      tags: [Sessions]
+      security: [{ AdminApiKey: [] }]
+      summary: List sessions
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - name: user_id
+          in: query
+          required: false
+          schema: { type: string }
+        - name: client_id
+          in: query
+          required: false
+          schema: { type: string, description: OAuth client_id (public identifier) }
+        - name: active_only
+          in: query
+          required: false
+          schema: { type: boolean, default: true }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions]
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: "#/components/schemas/Session" }
+                  next_cursor: { type: string, nullable: true }
+
+  /admin/tenants/{tenant_id}/sessions/{session_id}/revoke:
+    post:
+      tags: [Sessions]
+      security: [{ AdminApiKey: [] }]
+      summary: Revoke a session
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - { $ref: "#/components/parameters/SessionIdPath" }
+      responses:
+        "204":
+          description: Revoked
+        "404":
+          description: Not found
+
+  # =========================
+  # Audit
+  # =========================
+  /admin/tenants/{tenant_id}/audit:
+    get:
+      tags: [Audit]
+      security: [{ AdminApiKey: [] }]
+      summary: Query audit events
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - name: type
+          in: query
+          required: false
+          schema: { type: string }
+        - name: actor_type
+          in: query
+          required: false
+          schema: { type: string, enum: [admin, user, system] }
+        - name: actor_id
+          in: query
+          required: false
+          schema: { type: string }
+        - name: since
+          in: query
+          required: false
+          schema: { type: string, format: date-time }
+        - name: until
+          in: query
+          required: false
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events]
+                properties:
+                  events:
+                    type: array
+                    items: { $ref: "#/components/schemas/AuditEvent" }
+                  next_cursor: { type: string, nullable: true }
+
+  # =========================
+  # Policies (declarative)
+  # =========================
+  /admin/tenants/{tenant_id}/policies:
+    get:
+      tags: [Policies]
+      security: [{ AdminApiKey: [] }]
+      summary: List policies
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [active, inactive] }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+    post:
+      tags: [Policies]
+      security: [{ AdminApiKey: [] }]
+      summary: Create policy
+      parameters: [{ $ref: "#/components/parameters/TenantIdPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, document]
+              properties:
+                name: { type: string }
+                document:
+                  type: object
+                  additionalProperties: true
+                status: { type: string, enum: [active, inactive], default: active }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Policy" }
+
+  /admin/tenants/{tenant_id}/policies/{policy_id}:
+    get:
+      tags: [Policies]
+      security: [{ AdminApiKey: [] }]
+      summary: Get policy
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - { $ref: "#/components/parameters/PolicyIdPath" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Policy" }
+    patch:
+      tags: [Policies]
+      security: [{ AdminApiKey: [] }]
+      summary: Update policy (creates a new version)
+      description: |
+        Updating a policy creates a new version. Previous versions remain immutable.
+        The server increments version and returns the new policy record.
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - { $ref: "#/components/parameters/PolicyIdPath" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                document:
+                  type: object
+                  additionalProperties: true
+                status: { type: string, enum: [active, inactive] }
+      responses:
+        "200":
+          description: Updated (new version)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Policy" }
+
+  /admin/tenants/{tenant_id}/policies/{policy_id}/bindings:
+    get:
+      tags: [Policies]
+      security: [{ AdminApiKey: [] }]
+      summary: List policy bindings
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - { $ref: "#/components/parameters/PolicyIdPath" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [bindings]
+                properties:
+                  bindings:
+                    type: array
+                    items: { $ref: "#/components/schemas/PolicyBinding" }
+    post:
+      tags: [Policies]
+      security: [{ AdminApiKey: [] }]
+      summary: Create policy binding
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - { $ref: "#/components/parameters/PolicyIdPath" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bind_type, bind_id]
+              properties:
+                bind_type: { type: string, enum: [tenant, client, user, group] }
+                bind_id: { type: string }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PolicyBinding" }
+
+  /admin/tenants/{tenant_id}/policies/{policy_id}/bindings/{binding_id}:
+    delete:
+      tags: [Policies]
+      security: [{ AdminApiKey: [] }]
+      summary: Delete policy binding
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - { $ref: "#/components/parameters/PolicyIdPath" }
+        - name: binding_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204":
+          description: Deleted
+
+  # =========================
+  # RBAC (Casbin domain model)
+  # =========================
+  /admin/tenants/{tenant_id}/rbac/tuples:
+    get:
+      tags: [RBAC]
+      security: [{ AdminApiKey: [] }]
+      summary: List RBAC tuples (Casbin policies and groupings)
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - name: tuple_type
+          in: query
+          required: false
+          schema: { type: string, enum: [p, g] }
+        - name: v0
+          in: query
+          required: false
+          schema: { type: string }
+        - name: v1
+          in: query
+          required: false
+          schema: { type: string }
+        - name: v2
+          in: query
+          required: false
+          schema: { type: string }
+        - name: v3
+          in: query
+          required: false
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tuples]
+                properties:
+                  tuples:
+                    type: array
+                    items: { $ref: "#/components/schemas/RbacTuple" }
+                  next_cursor: { type: string, nullable: true }
+    post:
+      tags: [RBAC]
+      security: [{ AdminApiKey: [] }]
+      summary: Create RBAC tuple
+      description: |
+        Creates a Casbin tuple in the tenant domain.
+        Conventions:
+          - Users: "user:{uuid}"
+          - Roles: "role:{name}"
+          - Objects: "resource:{id}" or "project:*" etc.
+          - Actions: "read|write|admin" etc.
+      parameters: [{ $ref: "#/components/parameters/TenantIdPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tuple_type, v0, v1, v2]
+              properties:
+                tuple_type: { type: string, enum: [p, g] }
+                v0: { type: string }
+                v1: { type: string }
+                v2: { type: string }
+                v3: { type: string }
+                v4: { type: string }
+                v5: { type: string }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RbacTuple" }
+
+  /admin/tenants/{tenant_id}/rbac/tuples/{tuple_id}:
+    delete:
+      tags: [RBAC]
+      security: [{ AdminApiKey: [] }]
+      summary: Delete RBAC tuple
+      parameters:
+        - { $ref: "#/components/parameters/TenantIdPath" }
+        - { $ref: "#/components/parameters/RbacTupleIdPath" }
+      responses:
+        "204":
+          description: Deleted
+
+  /admin/tenants/{tenant_id}/rbac/enforce:
+    post:
+      tags: [RBAC]
+      security: [{ AdminApiKey: [] }]
+      summary: Evaluate an RBAC decision (debug/admin)
+      parameters: [{ $ref: "#/components/parameters/TenantIdPath" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RbacEnforceRequest" }
+      responses:
+        "200":
+          description: Decision
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RbacEnforceResponse" }
+
+  # =========================
+  # Public OIDC/OAuth2 (tenant host)
+  # =========================
+  /.well-known/openid-configuration:
+    get:
+      tags: [OIDC]
+      summary: OIDC discovery document
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OidcDiscovery" }
+
+  /oauth2/jwks.json:
+    get:
+      tags: [OIDC]
+      summary: JWKS endpoint (public)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JwkSet" }
+
+  /oauth2/authorize:
+    get:
+      tags: [OIDC]
+      summary: Authorization endpoint (Authorization Code + PKCE)
+      description: |
+        Standard OAuth2 authorization endpoint. Requires PKCE (S256).
+        If hosted UI is enabled and no valid web session is present, the server may redirect to /ui/login.
+      parameters:
+        - name: response_type
+          in: query
+          required: true
+          schema: { type: string, enum: [code] }
+        - name: client_id
+          in: query
+          required: true
+          schema: { type: string }
+        - name: redirect_uri
+          in: query
+          required: true
+          schema: { type: string, format: uri }
+        - name: scope
+          in: query
+          required: true
+          schema: { type: string }
+        - name: state
+          in: query
+          required: true
+          schema: { type: string }
+        - name: code_challenge
+          in: query
+          required: true
+          schema: { type: string }
+        - name: code_challenge_method
+          in: query
+          required: true
+          schema: { type: string, enum: [S256] }
+        - name: nonce
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "302":
+          description: Redirect to redirect_uri with code and state, or to UI login
+
+  /oauth2/token:
+    post:
+      tags: [OIDC]
+      summary: Token endpoint
+      description: |
+        Supports:
+        - authorization_code (with PKCE verifier)
+        - refresh_token (rotation required)
+        - client_credentials
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [grant_type]
+              properties:
+                grant_type:
+                  type: string
+                  enum: [authorization_code, refresh_token, client_credentials]
+                code: { type: string }
+                redirect_uri: { type: string, format: uri }
+                code_verifier: { type: string }
+                refresh_token: { type: string }
+                client_id: { type: string }
+                client_secret: { type: string }
+                scope: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OauthTokenResponse" }
+        "400":
+          description: Invalid grant/request
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: Invalid client
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /oauth2/userinfo:
+    get:
+      tags: [OIDC]
+      summary: UserInfo endpoint
+      security: [{ BearerToken: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserInfo" }
+        "401":
+          description: Unauthorized
+
+  /oauth2/revoke:
+    post:
+      tags: [OIDC]
+      summary: Token revocation endpoint
+      description: |
+        Revokes refresh tokens (required). Access token revocation is optional and typically
+        achieved via short TTL + refresh token revocation.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+                token_type_hint: { type: string, enum: [refresh_token, access_token] }
+                client_id: { type: string }
+                client_secret: { type: string }
+      responses:
+        "200":
+          description: OK
+
+  /oauth2/introspect:
+    post:
+      tags: [OIDC]
+      summary: Token introspection endpoint (optional for JWT deployments)
+      description: |
+        For JWT access tokens, introspection may validate signature/claims and return active=true/false,
+        optionally consulting revocation state. For opaque tokens, introspection is authoritative.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+                client_id: { type: string }
+                client_secret: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [active]
+                properties:
+                  active: { type: boolean }
+                  sub: { type: string, nullable: true }
+                  aud: { type: string, nullable: true }
+                  iss: { type: string, nullable: true }
+                  exp: { type: integer, nullable: true }
+                  iat: { type: integer, nullable: true }
+                  scope: { type: string, nullable: true }
+                  client_id: { type: string, nullable: true }
+                  tid: { type: string, nullable: true }
+                  roles:
+                    type: array
+                    nullable: true
+                    items: { type: string }
+
+  /oauth2/logout:
+    get:
+      tags: [OIDC]
+      summary: RP-initiated logout (optional)
+      parameters:
+        - name: id_token_hint
+          in: query
+          required: false
+          schema: { type: string }
+        - name: post_logout_redirect_uri
+          in: query
+          required: false
+          schema: { type: string, format: uri }
+        - name: state
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "302":
+          description: Redirect after logout
+
+  # =========================
+  # Hosted UI (optional)
+  # =========================
+  /ui/login:
+    get:
+      tags: [UI]
+      summary: Render login page (optional)
+      parameters:
+        - name: return_to
+          in: query
+          required: false
+          schema: { type: string, description: Relative path to return after login }
+      responses:
+        "200":
+          description: HTML
+          content:
+            text/html:
+              schema: { type: string }
+    post:
+      tags: [UI]
+      summary: Submit login (optional)
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+                return_to: { type: string }
+      responses:
+        "302":
+          description: Redirect after login (sets session cookie)
+        "401":
+          description: Invalid credentials
+
+  /ui/logout:
+    post:
+      tags: [UI]
+      summary: Logout current session (optional)
+      responses:
+        "302":
+          description: Redirect after logout (clears session cookie)
