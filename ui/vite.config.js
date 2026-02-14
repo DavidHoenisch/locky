@@ -3,6 +3,7 @@ import { svelte } from '@sveltejs/vite-plugin-svelte'
 
 export default defineConfig({
   plugins: [svelte()],
+  base: process.env.VITE_BASE_PATH || '/admin/ui/',
   build: {
     outDir: '../auth/ui/dist',
     emptyOutDir: true,

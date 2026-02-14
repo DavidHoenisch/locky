@@ -235,6 +235,40 @@ See `openapi.yaml` for complete API specification.
 - **AES-GCM** encrypted private keys
 - **Audit logging** for all sensitive operations
 
+## Python API Integration Tests
+
+An end-to-end Python suite is available under `integration_tests/` and targets a live Locky instance.
+
+### Install test dependencies
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-integration.txt
+```
+
+### Run against local docker-compose stack
+
+```bash
+docker compose up -d --build
+pytest
+```
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOCKY_BASE_URL` | `http://localhost:8080` | Base URL of Locky API |
+| `LOCKY_ADMIN_API_KEY` | `test-admin-key-123` | Admin API key sent as `X-Admin-Key` |
+| `LOCKY_TENANT_HOST` | `localhost` | Host header used for tenant resolution |
+| `LOCKY_SEEDED_EMAIL` | `test@example.com` | Seeded user email for OAuth flow tests |
+| `LOCKY_SEEDED_PASSWORD` | `password123` | Seeded user password for OAuth flow tests |
+| `LOCKY_SEEDED_CLIENT_ID` | `test-client-id` | Seeded OAuth client id |
+| `LOCKY_SEEDED_REDIRECT_URI` | `http://localhost:3000/callback` | Redirect URI for auth code flow |
+| `LOCKY_SEEDED_SCOPE` | `openid profile email` | Scope used in OAuth tests |
+
+The suite always validates health/admin endpoints and runs OAuth authorization-code tests when seeded OAuth prerequisites are present.
+
 ## Roadmap
 
 - [ ] MFA (TOTP, WebAuthn)

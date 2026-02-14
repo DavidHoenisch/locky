@@ -1,7 +1,7 @@
 package http
 
 import (
-	"net/http"
+	stdhttp "net/http"
 	"strings"
 
 	"github.com/locky/auth/core"
@@ -43,14 +43,19 @@ func NewServer(coreInstance *core.Core, config core.Config) *Server {
 	return s
 }
 
-// ServeHTTP implements the http.Handler interface
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+// ServeHTTP implements the stdhttp.Handler interface
+func (s *Server) ServeHTTP(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	// Apply CORS
-	s.corsMiddleware.Handler(http.HandlerFunc(s.handleRequest)).ServeHTTP(w, r)
+	s.corsMiddleware.Handler(stdhttp.HandlerFunc(s.handleRequest)).ServeHTTP(w, r)
 }
 
-func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
+func (s *Server) handleRequest(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+	path := strings.Trim(r.URL.Path, "/")
+	if path == "" {
+		path = "/"
+	} else {
+		path = "/" + path
+	}
 	method := r.Method
 
 	if strings.HasPrefix(path, "/admin/tenants/") {
@@ -60,23 +65,34 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Route the request
 	switch {
+	// Root: redirect to admin UI when enabled, otherwise minimal landing
+	case path == "/" && method == stdhttp.MethodGet:
+		if s.config.EnableAdminUI {
+			stdhttp.Redirect(w, r, "/admin/ui", stdhttp.StatusFound)
+		} else {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(stdhttp.StatusOK)
+			w.Write([]byte(`<!DOCTYPE html><html><head><title>Locky</title></head><body><h1>Locky</h1><p>Identity platform. Set ENABLE_ADMIN_UI=true for the admin UI.</p><p><a href="/healthz">Health</a></p></body></html>`))
+		}
+		return
+
 	// Health check
 	case path == "/healthz":
 		s.adminHandlers.HealthHandler(w, r)
 
 	// Admin API endpoints
-	case path == "/admin/tenants" && method == http.MethodGet:
+	case path == "/admin/tenants" && method == stdhttp.MethodGet:
 		s.withAdminAuth(s.adminHandlers.ListTenants)(w, r)
-	case path == "/admin/tenants" && method == http.MethodPost:
+	case path == "/admin/tenants" && method == stdhttp.MethodPost:
 		s.withAdminAuth(s.adminHandlers.CreateTenant)(w, r)
 	case path == "/admin/auth/keys":
 		s.withAdminAuth(s.handleAdminAuthKeys)(w, r)
-	case path == "/admin/ui" && method == http.MethodGet && s.config.EnableAdminUI:
-		s.handleAdminUI(w, r)
-	case path == "/admin/ui/login" && method == http.MethodPost && s.config.EnableAdminUI:
+	case path == "/admin/ui/login" && method == stdhttp.MethodPost && s.config.EnableAdminUI:
 		s.handleAdminUILogin(w, r)
-	case path == "/admin/ui/logout" && method == http.MethodPost && s.config.EnableAdminUI:
+	case path == "/admin/ui/logout" && method == stdhttp.MethodPost && s.config.EnableAdminUI:
 		s.handleAdminUILogout(w, r)
+	case (path == "/admin/ui" || path == "/admin/ui/" || path == "/admin/ui/login" || strings.HasPrefix(path, "/admin/ui/")) && method == stdhttp.MethodGet && s.config.EnableAdminUI:
+		s.serveAdminUIRoutes(w, r)
 
 	// OIDC Discovery endpoint
 	case path == "/.well-known/openid-configuration":
@@ -88,12 +104,12 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	// OAuth2 Authorize endpoint (GET shows login form, POST processes login)
 	case path == "/oauth2/authorize":
-		if method == http.MethodGet {
+		if method == stdhttp.MethodGet {
 			s.withTenant(s.handleLoginPage)(w, r)
-		} else if method == http.MethodPost {
+		} else if method == stdhttp.MethodPost {
 			s.withTenant(s.handleLoginSubmit)(w, r)
 		} else {
-			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
+			writeError(w, stdhttp.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
 		}
 
 	// OAuth2 Token endpoint
@@ -117,15 +133,15 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		s.withTenant(s.oidcHandlers.LogoutHandler)(w, r)
 
 	default:
-		writeError(w, http.StatusNotFound, "not_found", "Endpoint not found")
+		writeError(w, stdhttp.StatusNotFound, "not_found", "Endpoint not found")
 	}
 }
 
-func (s *Server) routeAdminTenantPath(w http.ResponseWriter, r *http.Request) {
+func (s *Server) routeAdminTenantPath(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	path := strings.Trim(r.URL.Path, "/")
 	parts := strings.Split(path, "/")
 	if len(parts) < 4 || parts[0] != "admin" || parts[1] != "tenants" {
-		writeError(w, http.StatusNotFound, "not_found", "Endpoint not found")
+		writeError(w, stdhttp.StatusNotFound, "not_found", "Endpoint not found")
 		return
 	}
 
@@ -134,54 +150,54 @@ func (s *Server) routeAdminTenantPath(w http.ResponseWriter, r *http.Request) {
 
 	if len(parts) == 4 && parts[3] == "users" {
 		switch r.Method {
-		case http.MethodGet:
+		case stdhttp.MethodGet:
 			s.withAdminAuth(s.adminHandlers.ListUsers)(w, r)
-		case http.MethodPost:
+		case stdhttp.MethodPost:
 			s.withAdminAuth(s.adminHandlers.CreateUser)(w, r)
 		default:
-			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
+			writeError(w, stdhttp.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
 		}
 		return
 	}
 
-	if len(parts) == 6 && parts[3] == "users" && parts[5] == "password" && r.Method == http.MethodPut {
+	if len(parts) == 6 && parts[3] == "users" && parts[5] == "password" && r.Method == stdhttp.MethodPut {
 		r.SetPathValue("user_id", parts[4])
 		s.withAdminAuth(s.adminHandlers.SetUserPassword)(w, r)
 		return
 	}
 
-	writeError(w, http.StatusNotFound, "not_found", "Endpoint not found")
+	writeError(w, stdhttp.StatusNotFound, "not_found", "Endpoint not found")
 }
 
-func (s *Server) withAdminAuth(handler http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func (s *Server) withAdminAuth(handler stdhttp.HandlerFunc) stdhttp.HandlerFunc {
+	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		if s.config.EnableAdminUI && s.isAdminUIAuthenticated(r) {
 			handler(w, r)
 			return
 		}
 
 		if s.adminMiddleware != nil {
-			s.adminMiddleware.Handler(http.HandlerFunc(handler)).ServeHTTP(w, r)
+			s.adminMiddleware.Handler(stdhttp.HandlerFunc(handler)).ServeHTTP(w, r)
 		} else {
 			handler(w, r)
 		}
 	}
 }
 
-func (s *Server) withTenant(handler http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func (s *Server) withTenant(handler stdhttp.HandlerFunc) stdhttp.HandlerFunc {
+	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		if s.tenantMiddleware != nil {
-			s.tenantMiddleware.Handler(http.HandlerFunc(handler)).ServeHTTP(w, r)
+			s.tenantMiddleware.Handler(stdhttp.HandlerFunc(handler)).ServeHTTP(w, r)
 		} else {
 			handler(w, r)
 		}
 	}
 }
 
-func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleLoginPage(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	// Simple HTML login form since UI isn't built
 	w.Header().Set("Content-Type", "text/html")
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(stdhttp.StatusOK)
 	w.Write([]byte(`<!DOCTYPE html>
 <html>
 <head>
@@ -213,10 +229,10 @@ func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 </html>`))
 }
 
-func (s *Server) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleLoginSubmit(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	// Parse form
 	if err := r.ParseForm(); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "Failed to parse form")
+		writeError(w, stdhttp.StatusBadRequest, "invalid_request", "Failed to parse form")
 		return
 	}
 
@@ -226,28 +242,28 @@ func (s *Server) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 	// Get tenant from context
 	tenant, ok := GetTenant(r.Context())
 	if !ok {
-		writeError(w, http.StatusBadRequest, "tenant_not_found", "Tenant not found")
+		writeError(w, stdhttp.StatusBadRequest, "tenant_not_found", "Tenant not found")
 		return
 	}
 
 	// Verify credentials
 	user, err := s.core.Store.Users().GetByEmail(r.Context(), tenant.ID, email)
 	if err != nil {
-		writeError(w, http.StatusUnauthorized, "invalid_credentials", "Invalid email or password")
+		writeError(w, stdhttp.StatusUnauthorized, "invalid_credentials", "Invalid email or password")
 		return
 	}
 
 	// Verify password
 	_, err = s.core.Store.Users().GetPassword(r.Context(), user.ID)
 	if err != nil {
-		writeError(w, http.StatusUnauthorized, "invalid_credentials", "Invalid email or password")
+		writeError(w, stdhttp.StatusUnauthorized, "invalid_credentials", "Invalid email or password")
 		return
 	}
 
 	// TODO: Actually verify password with crypto package
 	// For now just check if password matches the test password
 	if password != "password123" {
-		writeError(w, http.StatusUnauthorized, "invalid_credentials", "Invalid email or password")
+		writeError(w, stdhttp.StatusUnauthorized, "invalid_credentials", "Invalid email or password")
 		return
 	}
 
@@ -268,13 +284,13 @@ func (s *Server) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 	// Create new request with the query parameters
 	newReq := r.Clone(r.Context())
 	newReq.URL = &newURL
-	newReq.Method = http.MethodGet
+	newReq.Method = stdhttp.MethodGet
 
 	// Now process the OAuth authorization
 	s.oidcHandlers.AuthorizeHandler(w, newReq)
 }
 
-func (s *Server) handleAdminAuthKeys(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAdminAuthKeys(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	// Simplified - would implement full admin key management
-	writeError(w, http.StatusNotImplemented, "not_implemented", "Admin auth keys not implemented in MVP")
+	writeError(w, stdhttp.StatusNotImplemented, "not_implemented", "Admin auth keys not implemented in MVP")
 }
